@@ -1,5 +1,6 @@
 package com.ally.db;
 
+import com.ally.db.index.IndexFileWrapper;
 import com.ally.db.index.ValuePointer;
 import com.ally.db.storage.StorageFileWrapper;
 import com.ally.db.util.CompressionUtil;
@@ -11,12 +12,9 @@ import lombok.extern.slf4j.Slf4j;
 import javax.xml.bind.DatatypeConverter;
 import java.io.File;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.nio.file.StandardOpenOption;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -28,13 +26,11 @@ import java.util.zip.DataFormatException;
 @Slf4j
 public final class Ally {
 
-    private static final String INDEX_NAME = "index";
-    private static final String TEMP_INDEX_ABBY = "tempIndex";
     private static final String DB_DIRECTORY = "./db";
     private static final String FILE_EXTENSION = ".abby";
 
     private final Object lock = new Object();
-    private final Map<String, ValuePointer> inMemoryIndex = new ConcurrentHashMap<>();
+    private Map<String, ValuePointer> inMemoryIndex = new HashMap<>();
     private final Set<String> dirtyFilesNames = new HashSet<>();
     private final Set<StorageFileWrapper> setOfStorageFileWrappers = new HashSet<>();
     private final ScheduledExecutorService scheduledExecutorService = Executors.newScheduledThreadPool(4);
@@ -47,7 +43,7 @@ public final class Ally {
 
     private StorageFileWrapper currentStorageFileWrapper;
     private File directory;
-    private File index;
+    private IndexFileWrapper index;
 
     private Ally() {
 
@@ -78,12 +74,12 @@ public final class Ally {
 
             directory = createDbDirectory();
 
-            index = new File(DB_DIRECTORY + File.separator + INDEX_NAME + FILE_EXTENSION);
+            index = new IndexFileWrapper();
 
             loadIndexAndStorage(directory, index);
 
             scheduledExecutorService.scheduleAtFixedRate(this::dumpWriteBufferToDisk, 5, 5, TimeUnit.SECONDS);
-            scheduledExecutorService.scheduleAtFixedRate(this::dumpIndexToDisk, 5, 15, TimeUnit.SECONDS);
+            scheduledExecutorService.scheduleAtFixedRate(this::dumpIndexToDisk, 10, 10, TimeUnit.SECONDS);
             scheduledExecutorService.scheduleAtFixedRate(this::dumpEditBufferToDisk, 10, 10, TimeUnit.SECONDS);
             scheduledExecutorService.scheduleAtFixedRate(this::gc, 30, 30, TimeUnit.SECONDS);
         }
@@ -219,49 +215,7 @@ public final class Ally {
     private void dumpIndexToDisk() {
         synchronized (lock) {
 
-            File tempIndex = new File(DB_DIRECTORY + File.separator + TEMP_INDEX_ABBY + FILE_EXTENSION);
-
-            if (tempIndex.exists()) {
-                boolean tempIndexDeleted = tempIndex.delete();
-                if (tempIndexDeleted) {
-                    log.info("Old temp index was deleted");
-                } else {
-                    log.error("Failed to delete old temp index");
-                    System.exit(-1);
-                }
-            }
-
-            try {
-                boolean tempIndexCreated = tempIndex.createNewFile();
-                if (!tempIndexCreated) {
-                    log.error("Old temp index file already exists");
-                    System.exit(-1);
-                }
-            } catch (IOException e) {
-                log.error("Cannot create temp index file", e);
-                System.exit(-1);
-            }
-
-            inMemoryIndex.forEach((key, value) -> {
-                try {
-                    Files.write(Paths.get(tempIndex.getPath()),
-                            (key + '|' + value.getFilename() + '|' + value.getLineNumber() + System.lineSeparator())
-                                    .getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
-                } catch (IOException e) {
-                    log.error("Failed to write index on disk", e);
-                    System.exit(-1);
-                }
-            });
-
-            boolean indexRenamed = tempIndex.renameTo(index);
-            if (indexRenamed) {
-                log.info("Renamed index file");
-            } else {
-                log.error("Failed to rename index file");
-                System.exit(-1);
-            }
-
-            log.info("Index was written on disk");
+           index.writeIndexOnDisk(inMemoryIndex);
 
         }
     }
@@ -312,21 +266,21 @@ public final class Ally {
                 return inMemoryIndex.containsKey(key)
                         && inMemoryIndex.get(key).getFilename().equals(dirtyStorageFileWrapper.getFileName());
             })
-                    .forEach(line -> {
-                        try {
+            .forEach(line -> {
+                try {
 
-                            dirtyStorageFileWrapper.appendLine(line, "");
+                    dirtyStorageFileWrapper.appendLine(line, "");
 
-                            String key = line.split("\\|")[0];
-                            ValuePointer oldValuePointer = inMemoryIndex.get(key);
+                    String key = line.split("\\|")[0];
+                    ValuePointer oldValuePointer = inMemoryIndex.get(key);
 
-                            inMemoryIndex.put(key, new ValuePointer(oldValuePointer.getFilename(), dirtyStorageFileWrapper.getNumberOfLines()));
+                    inMemoryIndex.put(key, new ValuePointer(oldValuePointer.getFilename(), dirtyStorageFileWrapper.getNumberOfLines()));
 
-                        } catch (IOException e) {
-                            log.error("Failed to write into temp file from dirty file", e);
-                            System.exit(-1);
-                        }
-                    });
+                } catch (IOException e) {
+                    log.error("Failed to write into temp file from dirty file", e);
+                    System.exit(-1);
+                }
+            });
 
             log.info("Wrote clean content to storage file");
 
@@ -359,11 +313,9 @@ public final class Ally {
             }
         }
 
-
     }
 
     private byte[] getElement(String hash) {
-
 
         synchronized (lock) {
             if (readCache.asMap().containsKey(hash)) {
@@ -404,11 +356,11 @@ public final class Ally {
 
     }
 
-    private void loadIndexAndStorage(File directory, File index) {
+    private void loadIndexAndStorage(File directory, IndexFileWrapper index) {
 
         File[] allRawStorageFiles = directory.listFiles((dir, name) -> name.startsWith("s") && name.endsWith(FILE_EXTENSION));
 
-        if (index.exists() && !index.isDirectory() && index.length() != 0 && allRawStorageFiles != null && allRawStorageFiles.length != 0) {
+        if (index.exists() && allRawStorageFiles != null && allRawStorageFiles.length != 0) {
 
             List<StorageFileWrapper> storageFileWrappers = Arrays.stream(allRawStorageFiles)
                     .filter(File::exists)
@@ -426,12 +378,7 @@ public final class Ally {
             setOfStorageFileWrappers.addAll(storageFileWrappers);
 
             //read index into memory
-            try {
-                loadIndex(DB_DIRECTORY + File.separator + INDEX_NAME + FILE_EXTENSION);
-            } catch (IOException e) {
-                log.error("Failed to load index", e);
-                System.exit(-1);
-            }
+            inMemoryIndex = index.loadIndex();
 
             //choose smallest storage file as a current storage file
             StorageFileWrapper smallestStorageFileWrapper = storageFileWrappers.stream().min(Comparator.comparing(
@@ -442,11 +389,11 @@ public final class Ally {
 
         } else {
 
-            if (index.exists() && !index.isDirectory()) {
+            if (index.exists()) {
 
                 //if there is no storage file, delete the index
                 if (allRawStorageFiles == null || allRawStorageFiles.length == 0 || currentStorageFileWrapper == null) {
-                    deleteIndex(index);
+                    index.deleteIndex();
                 }
 
             } else {
@@ -456,7 +403,7 @@ public final class Ally {
             }
 
             //create index
-            createIndex(index);
+            index.createIndex();
 
             //create 1 storage file
             try {
@@ -465,36 +412,6 @@ public final class Ally {
                 log.error("Failed to create new StorageFileWrapper");
                 System.exit(-1);
             }
-        }
-    }
-
-    private void loadIndex(String indexFileName) throws IOException {
-
-        Files.readAllLines(Paths.get(indexFileName), StandardCharsets.UTF_8).stream()
-                .map(element -> element.split("\\|"))
-                .forEach(elementArray -> inMemoryIndex.put(elementArray[0],
-                        new ValuePointer(elementArray[1], Long.parseLong(elementArray[2]))));
-
-    }
-
-    private void createIndex(File index) {
-        try {
-            boolean newIndexCreated = index.createNewFile();
-            if (!newIndexCreated) {
-                log.error("Index file already exists");
-                System.exit(-1);
-            }
-        } catch (IOException e) {
-            log.error("Cannot create index file", e);
-            System.exit(-1);
-        }
-    }
-
-    private void deleteIndex(File index) {
-        boolean indexWasDeleted = index.delete();
-        if (!indexWasDeleted) {
-            log.error("Cannot delete old index");
-            System.exit(-1);
         }
     }
 
